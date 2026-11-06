@@ -5,7 +5,8 @@
 //! Read: worksheets, shared strings, cell values, formulas (text and cached results, including
 //! shared and array formulas), number formats, the 1904 date system, merged cells, column
 //! widths, row heights, defined names, print areas, print titles and the calculation settings
-//! (mode, iteration, precision as displayed). Everything else (fonts, fills, borders, charts,
+//! (mode, iteration, precision as displayed), and cell fills (pattern and colours, with the
+//! workbook's palette). Everything else (fonts, borders, charts,
 //! pictures, comments, conditional formats, validation, macros) is skipped with a warning.
 //! Encrypted workbooks and pre-BIFF8 versions are refused.
 
@@ -17,10 +18,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, DateSystem, MAX_COLS, MAX_ROWS, RangeRef, Value};
+use gridcraft_model::style::{Color, Fill, PatternType};
 use gridcraft_model::{CalcMode, CalcSettings, Cell, DefinedName, Formula, LineInfo, NumFmt, Sheet, Style, StyleId, Visibility, Workbook};
 
 use crate::cfb::Compound;
-use crate::tables::{builtin_format, col_width_to_px, pt_to_px};
+use crate::tables::{INDEXED, builtin_format, col_width_to_px, pt_to_px};
 use crate::{IoError, ReadReport};
 use formula::{Links, Mode, SupBook, Unsupported, Xti, cell_error, decode};
 use records::{Cursor, Record, Records};
@@ -120,11 +122,55 @@ struct Globals {
     sheets: Vec<BoundSheet>,
     date1904: bool,
     formats: HashMap<u16, String>,
-    xf_formats: Vec<u16>,
+    xfs: Vec<Xf>,
+    /// Colour indexes 8.. as the Palette record sets them; the default palette otherwise.
+    palette: Option<Vec<u32>>,
     sst: Vec<Arc<str>>,
     links: Links,
     names: Vec<Lbl>,
     precision_as_displayed: bool,
+}
+
+/// What an XF record says that the model keeps: the number format and the fill.
+#[derive(Clone, Copy, Default)]
+struct Xf {
+    ifmt: u16,
+    /// Fill pattern (`fls`, 0 = none, 1 = solid, 2..=18 the hatched patterns).
+    fls: u8,
+    /// Pattern foreground and background as palette indexes (`icvFore`, `icvBack`).
+    fore: u8,
+    back: u8,
+}
+
+/// `fls` ([MS-XLS] 2.5.12 FillPattern) as the model's pattern.
+fn pattern(fls: u8) -> PatternType {
+    match fls {
+        1 => PatternType::Solid,
+        2 => PatternType::Gray50,
+        3 => PatternType::Gray75,
+        4 => PatternType::Gray25,
+        5 => PatternType::DarkHorizontal,
+        6 => PatternType::DarkVertical,
+        7 => PatternType::DarkDown,
+        8 => PatternType::DarkUp,
+        9 => PatternType::DarkGrid,
+        10 => PatternType::DarkTrellis,
+        11 => PatternType::LightHorizontal,
+        12 => PatternType::LightVertical,
+        13 => PatternType::LightDown,
+        14 => PatternType::LightUp,
+        15 => PatternType::LightGrid,
+        16 => PatternType::LightTrellis,
+        17 => PatternType::Gray125,
+        18 => PatternType::Gray0625,
+        _ => PatternType::None,
+    }
+}
+
+/// A palette index ([MS-XLS] 2.5.161 Icv) as a colour: 0..=63 from the palette, 64 and 65
+/// (system window text and background) and anything else automatic.
+fn icv_color(icv: u8, palette: &[u32]) -> Color {
+    palette.get(usize::from(icv)).map_or(Color::Auto, |&rgb| Color::Rgb(rgb))
 }
 
 /// Reads an Excel 97-2003 workbook. Inspect the report's warnings for what was skipped.
@@ -150,17 +196,29 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
     let mut wb = Workbook::new();
     wb.sheets.clear();
     wb.date_system = if g.date1904 { DateSystem::D1904 } else { DateSystem::D1900 };
-    // One model style per XF: only the number format is imported.
-    let styles: Vec<StyleId> = g
-        .xf_formats
-        .iter()
-        .map(|ifmt| {
-            let code = g.formats.get(ifmt).map(String::as_str).or_else(|| builtin_format(u32::from(*ifmt))).unwrap_or("General");
-            if code.eq_ignore_ascii_case("General") {
-                StyleId::DEFAULT
-            } else {
-                wb.styles.intern(Style { num_fmt: NumFmt::new(code), ..Style::default() })
+    // One model style per XF: the number format and the fill.
+    let mut palette = INDEXED.to_vec();
+    if let Some(custom) = &g.palette {
+        for (i, rgb) in custom.iter().enumerate() {
+            if let Some(slot) = palette.get_mut(8 + i) {
+                *slot = *rgb;
             }
+        }
+    }
+    let styles: Vec<StyleId> = g
+        .xfs
+        .iter()
+        .map(|xf| {
+            let code = g.formats.get(&xf.ifmt).map(String::as_str).or_else(|| builtin_format(u32::from(xf.ifmt))).unwrap_or("General");
+            let mut style = Style::default();
+            if !code.eq_ignore_ascii_case("General") {
+                style.num_fmt = NumFmt::new(code);
+            }
+            let pat = pattern(xf.fls);
+            if pat != PatternType::None {
+                style.fill = Fill { pattern: pat, fg: icv_color(xf.fore, &palette), bg: icv_color(xf.back, &palette) };
+            }
+            if style == Style::default() { StyleId::DEFAULT } else { wb.styles.intern(style) }
         })
         .collect();
 
@@ -199,7 +257,7 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
     // The overview comes first.
     report.warnings.insert(
         0,
-        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, number formats, merged cells, column widths, row heights and defined names were read. Fonts, fills, borders, charts, pictures, comments and other features are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
+        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, number formats, cell fills, merged cells, column widths, row heights and defined names were read. Fonts, borders, charts, pictures, comments and other features are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
     );
     Ok((wb, report))
 }
@@ -270,10 +328,32 @@ fn globals(stream: &[u8], budget: &mut Budget, report: &mut ReadReport) -> Resul
                 g.formats.insert(ifmt, code);
             }
             0x00E0 => {
-                if g.xf_formats.len() < MAX_XFS {
+                if g.xfs.len() < MAX_XFS {
+                    // XF ([MS-XLS] 2.4.353): ifnt, ifmt, protection and parent, alignment (4
+                    // bytes), border lines and colours (4 bytes), then fls in the top six bits
+                    // of a 32-bit field and icvFore / icvBack in the last 16 bits.
                     c.u16()?;
-                    g.xf_formats.push(c.u16()?);
+                    let mut xf = Xf { ifmt: c.u16()?, ..Xf::default() };
+                    if c.remaining() >= 16 {
+                        c.skip(10)?;
+                        xf.fls = (c.u32()? >> 26) as u8 & 0x3F;
+                        let colors = c.u16()?;
+                        xf.fore = (colors & 0x7F) as u8;
+                        xf.back = ((colors >> 7) & 0x7F) as u8;
+                    }
+                    g.xfs.push(xf);
                 }
+            }
+            0x0092 => {
+                // Palette ([MS-XLS] 2.4.188): the colours of indexes 8 and up, as R, G, B, unused.
+                let n = usize::from(c.u16()?).min(56).min(c.remaining() / 4);
+                let mut colors = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let (r, gr, b) = (c.u8()?, c.u8()?, c.u8()?);
+                    c.u8()?;
+                    colors.push((u32::from(r) << 16) | (u32::from(gr) << 8) | u32::from(b));
+                }
+                g.palette = Some(colors);
             }
             0x00FC => g.sst = shared_strings(&mut c, budget)?,
             0x01AE => {

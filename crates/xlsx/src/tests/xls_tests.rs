@@ -594,3 +594,54 @@ fn a_format_shorter_than_its_count_keeps_its_characters() {
     assert_eq!(fmt("A3"), "0.000");
     assert!(report.warnings.iter().any(|w| w.contains("declared length")), "{:?}", report.warnings);
 }
+
+/// An XF with a fill: pattern `fls`, colours `fore` and `back` as palette indexes.
+fn xf_fill(ifmt: u16, fls: u8, fore: u8, back: u8) -> Vec<u8> {
+    let fls_word = u32::from(fls) << 26;
+    let colors = u16::from(fore) | (u16::from(back) << 7);
+    rec(0x00E0, &cat(&[&u16s(&[0, ifmt, 0]), &[0; 8], &fls_word.to_le_bytes(), &colors.to_le_bytes()]))
+}
+
+#[test]
+fn reads_cell_fills_with_the_workbook_palette() {
+    // A roster coloured by shift, the way many are kept in Excel 97-2003: blank cells whose
+    // only content is the fill, one with a custom palette colour, one hatched.
+    // The Palette record lists all 56 colours: Excel's defaults, with index 10 changed.
+    let mut palette: Vec<u8> = crate::tables::INDEXED[8..64].iter().flat_map(|&c| [(c >> 16) as u8, (c >> 8) as u8, c as u8, 0]).collect();
+    palette[(10 - 8) * 4..(10 - 8) * 4 + 3].copy_from_slice(&[0x12, 0x34, 0x56]);
+    let boundsheet = |pos: u32| rec(0x0085, &cat(&[&pos.to_le_bytes(), &[0, 0, 4, 0], b"Plan"]));
+    let globals = |pos: u32| {
+        cat(&[
+            &bof(0x0005),
+            &rec(0x0092, &cat(&[&56u16.to_le_bytes(), &palette])),
+            &xf_fill(0, 0, 64, 65),
+            &xf_fill(0, 1, 42, 65),
+            &xf_fill(0, 1, 10, 65),
+            &xf_fill(0, 4, 12, 9),
+            &xf_fill(14, 1, 42, 65), // a date format and a fill
+            &boundsheet(pos),
+            &eof(),
+        ])
+    };
+    let sheet = cat(&[
+        &bof(0x0010),
+        &rec(0x0201, &cell(0, 0, 1)),
+        &rec(0x00BE, &cat(&[&u16s(&[1, 0]), &u16s(&[2, 3]), &u16s(&[1])])),
+        &rec(0x0203, &cat(&[&cell(2, 0, 4), &46000.0f64.to_le_bytes()])),
+        &rec(0x0203, &cat(&[&cell(3, 0, 0), &1.0f64.to_le_bytes()])),
+        &eof(),
+    ]);
+    let len = globals(0).len() as u32;
+    let (wb, report) = read_xls(&compound("Workbook", &cat(&[&globals(len), &sheet]))).unwrap();
+    assert!(report.warnings[0].contains("cell fills"), "{:?}", report.warnings);
+    let fill = |a1: &str| wb.styles.get(wb.sheets[0].style_id(CellRef::parse(a1).unwrap())).fill;
+    use gridcraft_model::style::{Color, PatternType};
+    // Default palette index 42 is #CCFFCC; index 10 comes from the Palette record.
+    assert_eq!((fill("A1").pattern, fill("A1").fg), (PatternType::Solid, Color::Rgb(0xCCFFCC)));
+    assert_eq!((fill("A2").pattern, fill("A2").fg), (PatternType::Solid, Color::Rgb(0x123456)));
+    assert_eq!((fill("B2").pattern, fill("B2").fg, fill("B2").bg), (PatternType::Gray25, Color::Rgb(0x0000FF), Color::Rgb(0xFFFFFF)));
+    let a3 = wb.styles.get(wb.sheets[0].style_id(CellRef::parse("A3").unwrap()));
+    assert_eq!((a3.fill.pattern, a3.num_fmt.as_str()), (PatternType::Solid, "m/d/yyyy"));
+    // No fill and no format: the default style, not a style per XF.
+    assert_eq!(wb.sheets[0].style_id(CellRef::parse("A4").unwrap()), gridcraft_model::StyleId::DEFAULT);
+}
